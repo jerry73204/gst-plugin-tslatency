@@ -8,7 +8,7 @@ use gst_base::subclass::BaseTransformMode;
 use gst_video::{
     prelude::*,
     subclass::prelude::{BaseTransformImpl, VideoFilterImpl},
-    VideoCapsBuilder, VideoFormat, VideoFrameRef,
+    VideoCapsBuilder, VideoFilter, VideoFormat, VideoFrameRef,
 };
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
@@ -103,10 +103,31 @@ impl Default for Properties {
 impl ObjectSubclass for TsLatencyMeasure {
     const NAME: &'static str = "GstTsLatencyMeasure";
     type Type = super::TsLatencyMeasure;
-    type ParentType = gst::Element;
+    type ParentType = VideoFilter;
 }
 
 impl ObjectImpl for TsLatencyMeasure {
+    fn properties() -> &'static [glib::ParamSpec] {
+        static PROPERTIES: Lazy<Vec<glib::ParamSpec>> = Lazy::new(|| {
+            vec![
+                glib::ParamSpecUInt64::builder("x")
+                    .nick("x")
+                    .blurb("Binary time code X position")
+                    .default_value(0)
+                    .mutable_playing()
+                    .build(),
+                glib::ParamSpecUInt64::builder("y")
+                    .nick("y")
+                    .blurb("Binary time code Y position")
+                    .default_value(0)
+                    .mutable_playing()
+                    .build(),
+            ]
+        });
+
+        PROPERTIES.as_ref()
+    }
+
     fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
         match pspec.name() {
             "x" => {

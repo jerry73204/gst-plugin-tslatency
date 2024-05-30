@@ -10,7 +10,7 @@ pub fn register(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
     gst::Element::register(
         Some(plugin),
         "tslatencystamper",
-        gst::Rank::PRIMARY,
+        gst::Rank::NONE,
         TsLatencyStamper::static_type(),
     )
 }
