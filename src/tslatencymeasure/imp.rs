@@ -237,28 +237,44 @@ impl VideoFilterImpl for TsLatencyMeasure {
                     Some(match p[0..3] {
                         [255, 255, 255] => true,
                         [0, 0, 0] => false,
-                        _ => return None,
+                        // _ => return None,
+                        _ => {
+                            // dbg!(&p[0..3]);
+                            false
+                        }
                     })
                 }),
             VideoFormat::Rgba | VideoFormat::Bgra => self.parse_time_code(frame, |p| {
                 Some(match p[0..4] {
                     [255, 255, 255, 255] => true,
                     [0, 0, 0, 255] => false,
-                    _ => return None,
+                    // _ => return None,
+                    _ => {
+                        // dbg!(&p[0..4]);
+                        false
+                    }
                 })
             }),
             VideoFormat::Xrgb | VideoFormat::Xbgr => self.parse_time_code(frame, |p| {
                 Some(match p[1..4] {
                     [255, 255, 255] => true,
                     [0, 0, 255] => false,
-                    _ => return None,
+                    // _ => return None,
+                    _ => {
+                        // dbg!(&p[1..4]);
+                        false
+                    }
                 })
             }),
             VideoFormat::Argb | VideoFormat::Abgr => self.parse_time_code(frame, |p| {
                 Some(match p[0..4] {
                     [255, 255, 255, 255] => true,
                     [255, 0, 0, 0] => false,
-                    _ => return None,
+                    // _ => return None,
+                    _ => {
+                        // dbg!(&p[0..4]);
+                        false
+                    }
                 })
             }),
             _ => unimplemented!(),

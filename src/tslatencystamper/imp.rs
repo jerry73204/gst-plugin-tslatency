@@ -1,5 +1,6 @@
 use glib::subclass::{prelude::*, types::ObjectSubclass};
 use gst::{
+    info,
     subclass::{prelude::*, ElementMetadata},
     BufferRef, Clock, FlowError, FlowSuccess, PadDirection, PadPresence, PadTemplate, SystemClock,
 };
@@ -125,7 +126,7 @@ impl ObjectImpl for TsLatencyStamper {
             "x" => {
                 let mut props = self.props.lock().unwrap();
                 let x = value.get().expect("type checked upstream");
-                gst::info!(
+                info!(
                     CAT,
                     imp: self,
                     "Changing hue-shift from {} to {}",
@@ -137,7 +138,7 @@ impl ObjectImpl for TsLatencyStamper {
             "y" => {
                 let mut props = self.props.lock().unwrap();
                 let y = value.get().expect("type checked upstream");
-                gst::info!(
+                info!(
                     CAT,
                     imp: self,
                     "Changing hue-shift from {} to {}",
