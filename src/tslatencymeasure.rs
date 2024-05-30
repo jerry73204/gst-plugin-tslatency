@@ -9,7 +9,7 @@ glib::wrapper! {
 pub fn register(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
     gst::Element::register(
         Some(plugin),
-        "tslatency_measure",
+        "tslatencymeasure",
         gst::Rank::PRIMARY,
         TsLatencyMeasure::static_type(),
     )

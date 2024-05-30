@@ -1,9 +1,9 @@
-mod tslatency_measure;
-mod tslatency_stamper;
+mod tslatencymeasure;
+mod tslatencystamper;
 
 fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
-    tslatency_stamper::register(plugin)?;
-    tslatency_measure::register(plugin)?;
+    tslatencystamper::register(plugin)?;
+    tslatencymeasure::register(plugin)?;
     Ok(())
 }
 

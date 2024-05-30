@@ -1,6 +1,5 @@
 use glib::subclass::{prelude::*, types::ObjectSubclass};
 use gst::{
-    info,
     subclass::{prelude::*, ElementMetadata},
     BufferRef, Clock, FlowError, FlowSuccess, PadDirection, PadPresence, PadTemplate, SystemClock,
 };
@@ -15,13 +14,13 @@ use std::sync::Mutex;
 
 static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
     gst::DebugCategory::new(
-        "tslatency_measure",
+        "tslatencystamper",
         gst::DebugColorFlags::empty(),
-        Some("Measure latency using binary time code stamped on frames"),
+        Some("Binary time code stamper"),
     )
 });
 
-pub struct TsLatencyMeasure {
+pub struct TsLatencyStamper {
     props: Mutex<Properties>,
     clock: Clock,
 }
@@ -32,20 +31,22 @@ struct Properties {
     y: u64,
 }
 
-impl TsLatencyMeasure {
-    fn parse_time_code(
+impl TsLatencyStamper {
+    fn time_code_overlay(
         &self,
         frame: &mut VideoFrameRef<&mut BufferRef>,
-        get_color: impl Fn(&[u8]) -> Option<bool>,
+        white: impl Fn(&mut [u8]),
+        black: impl Fn(&mut [u8]),
     ) {
         let Properties {
             x: start_x,
             y: start_y,
         } = *self.props.lock().unwrap();
 
-        let curr_usecs = {
+        let bitmap: [u8; 8] = {
             let time = self.clock.time().unwrap();
-            time.useconds()
+            let usecs = time.useconds();
+            usecs.to_be_bytes()
         };
 
         let stride = frame.plane_stride()[0] as usize;
@@ -57,34 +58,25 @@ impl TsLatencyMeasure {
         let end_x = start_x + 8;
         let end_y = start_y + 8;
 
-        let mut bitmap = [0u8; 8];
+        let lines = data[(start_y * stride)..(end_y * stride)].chunks_exact_mut(stride);
 
-        let lines = data[(start_y * stride)..(end_y * stride)].chunks_exact(stride);
-        for (line, byte) in lines.zip(&mut bitmap) {
+        for (line, byte) in lines.zip(bitmap) {
             let pixels =
-                line[(start_x * nb_channels)..(end_x * nb_channels)].chunks_exact(nb_channels);
+                line[(start_x * nb_channels)..(end_x * nb_channels)].chunks_exact_mut(nb_channels);
 
-            *byte = pixels.enumerate().fold(0u8, |byte, (nth, pixel)| {
-                if get_color(pixel).unwrap() {
-                    byte | (1 << nth)
+            for (nth, pixel) in pixels.enumerate() {
+                let color: bool = byte & (1 << nth) != 0;
+                if color {
+                    white(pixel);
                 } else {
-                    byte
+                    black(pixel);
                 }
-            });
+            }
         }
-
-        let prev_usecs = u64::from_be_bytes(bitmap);
-        let diff_usecs = curr_usecs as i64 - prev_usecs as i64;
-
-        info!(
-            CAT,
-            imp: self,
-            "Delay {diff_usecs} usecs",
-        );
     }
 }
 
-impl Default for TsLatencyMeasure {
+impl Default for TsLatencyStamper {
     fn default() -> Self {
         Self {
             props: Mutex::new(Properties::default()),
@@ -100,19 +92,19 @@ impl Default for Properties {
 }
 
 #[glib::object_subclass]
-impl ObjectSubclass for TsLatencyMeasure {
-    const NAME: &'static str = "GstTsLatencyMeasure";
-    type Type = super::TsLatencyMeasure;
+impl ObjectSubclass for TsLatencyStamper {
+    const NAME: &'static str = "GstTsLatencyStamper";
+    type Type = super::TsLatencyStamper;
     type ParentType = gst::Element;
 }
 
-impl ObjectImpl for TsLatencyMeasure {
+impl ObjectImpl for TsLatencyStamper {
     fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
         match pspec.name() {
             "x" => {
                 let mut props = self.props.lock().unwrap();
                 let x = value.get().expect("type checked upstream");
-                info!(
+                gst::info!(
                     CAT,
                     imp: self,
                     "Changing hue-shift from {} to {}",
@@ -124,7 +116,7 @@ impl ObjectImpl for TsLatencyMeasure {
             "y" => {
                 let mut props = self.props.lock().unwrap();
                 let y = value.get().expect("type checked upstream");
-                info!(
+                gst::info!(
                     CAT,
                     imp: self,
                     "Changing hue-shift from {} to {}",
@@ -152,15 +144,15 @@ impl ObjectImpl for TsLatencyMeasure {
     }
 }
 
-impl GstObjectImpl for TsLatencyMeasure {}
+impl GstObjectImpl for TsLatencyStamper {}
 
-impl ElementImpl for TsLatencyMeasure {
+impl ElementImpl for TsLatencyStamper {
     fn metadata() -> Option<&'static ElementMetadata> {
         static ELEMENT_METADATA: Lazy<ElementMetadata> = Lazy::new(|| {
             ElementMetadata::new(
-                "latency measurement using  binary time code",
+                "Binary time code stamper",
                 "Filter/Effect/Converter/Video",
-                "Measure latency using binary time code stamped on frames",
+                "Stamp binary time code overlay on incoming frames",
                 "Jerry Lin <jerry73204@gmail.com>",
             )
         });
@@ -199,47 +191,55 @@ impl ElementImpl for TsLatencyMeasure {
     }
 }
 
-impl BaseTransformImpl for TsLatencyMeasure {
+impl BaseTransformImpl for TsLatencyStamper {
     const MODE: BaseTransformMode = BaseTransformMode::AlwaysInPlace;
     const PASSTHROUGH_ON_SAME_CAPS: bool = false;
     const TRANSFORM_IP_ON_PASSTHROUGH: bool = false;
 }
 
-impl VideoFilterImpl for TsLatencyMeasure {
+impl VideoFilterImpl for TsLatencyStamper {
     fn transform_frame_ip(
         &self,
         frame: &mut VideoFrameRef<&mut BufferRef>,
     ) -> Result<FlowSuccess, FlowError> {
         match frame.format() {
             VideoFormat::Rgbx | VideoFormat::Rgb | VideoFormat::Bgrx | VideoFormat::Bgr => self
-                .parse_time_code(frame, |p| {
-                    Some(match p[0..3] {
-                        [255, 255, 255] => true,
-                        [0, 0, 0] => false,
-                        _ => return None,
-                    })
-                }),
-            VideoFormat::Rgba | VideoFormat::Bgra => self.parse_time_code(frame, |p| {
-                Some(match p[0..4] {
-                    [255, 255, 255, 255] => true,
-                    [0, 0, 0, 255] => false,
-                    _ => return None,
-                })
-            }),
-            VideoFormat::Xrgb | VideoFormat::Xbgr => self.parse_time_code(frame, |p| {
-                Some(match p[1..4] {
-                    [255, 255, 255] => true,
-                    [0, 0, 255] => false,
-                    _ => return None,
-                })
-            }),
-            VideoFormat::Argb | VideoFormat::Abgr => self.parse_time_code(frame, |p| {
-                Some(match p[0..4] {
-                    [255, 255, 255, 255] => true,
-                    [255, 0, 0, 0] => false,
-                    _ => return None,
-                })
-            }),
+                .time_code_overlay(
+                    frame,
+                    |p| {
+                        p[0..3].fill(255);
+                    },
+                    |p| {
+                        p[0..3].fill(0);
+                    },
+                ),
+            VideoFormat::Rgba | VideoFormat::Bgra => self.time_code_overlay(
+                frame,
+                |p| {
+                    p[0..4].fill(255);
+                },
+                |p| {
+                    p[0..4].copy_from_slice(&[0, 0, 0, 255]);
+                },
+            ),
+            VideoFormat::Xrgb | VideoFormat::Xbgr => self.time_code_overlay(
+                frame,
+                |p| {
+                    p[1..4].fill(255);
+                },
+                |p| {
+                    p[1..4].fill(0);
+                },
+            ),
+            VideoFormat::Argb | VideoFormat::Abgr => self.time_code_overlay(
+                frame,
+                |p| {
+                    p[0..4].fill(255);
+                },
+                |p| {
+                    p[0..4].copy_from_slice(&[255, 0, 0, 0]);
+                },
+            ),
             _ => unimplemented!(),
         }
 
