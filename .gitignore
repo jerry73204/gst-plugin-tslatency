@@ -1,0 +1,10 @@
+# editor
+*~
+.*~
+\#*#
+*.swo
+*.swp
+
+# rust
+/target
+/Cargo.lock
