@@ -11,7 +11,6 @@ use gst_video::{
     VideoCapsBuilder, VideoFilter, VideoFormat, VideoFrameRef,
 };
 use once_cell::sync::Lazy;
-use qrcode_generator::QrCodeEcc;
 use std::sync::Mutex;
 
 const DEFAULT_X: u64 = 0;
@@ -54,8 +53,27 @@ impl TsLatencyStamper {
             height,
         } = *self.props.lock().unwrap();
 
-        let time_string = self.clock.time().unwrap().useconds().to_string();
-        let bitmap = qrcode_generator::to_matrix(time_string, QrCodeEcc::Low).unwrap();
+        let usecs = self.clock.time().unwrap().useconds();
+
+        let bitmap = {
+            let mut bitmap = [[false; 8]; 8];
+            usecs
+                .to_be_bytes()
+                .into_iter()
+                .zip(&mut bitmap)
+                .for_each(|(byte, row)| {
+                    (0..u8::BITS)
+                        .map(|nth| 1 << nth)
+                        .map(|bit| (byte & bit) != 0)
+                        .zip(row)
+                        .for_each(|(bit, cell)| {
+                            *cell = bit;
+                        });
+                });
+
+            bitmap
+        };
+
         let bitmap_h = bitmap.len();
         let bitmap_w = bitmap[0].len();
 

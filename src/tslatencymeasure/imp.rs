@@ -1,6 +1,6 @@
 use glib::subclass::{prelude::*, types::ObjectSubclass};
 use gst::{
-    info,
+    error, info,
     subclass::{prelude::*, ElementMetadata},
     BufferRef, Clock, FlowError, FlowSuccess, PadDirection, PadPresence, PadTemplate, SystemClock,
 };
@@ -10,8 +10,14 @@ use gst_video::{
     subclass::prelude::{BaseTransformImpl, VideoFilterImpl},
     VideoCapsBuilder, VideoFilter, VideoFormat, VideoFrameRef,
 };
+use image::{flat::SampleLayout, imageops::FilterType, FlatSamples, Luma, Rgba};
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
+
+const DEFAULT_X: u32 = 0;
+const DEFAULT_Y: u32 = 0;
+const DEFAULT_WIDTH: u32 = 256;
+const DEFAULT_HEIGHT: u32 = 256;
 
 static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
     gst::DebugCategory::new(
@@ -28,19 +34,19 @@ pub struct TsLatencyMeasure {
 
 #[derive(Clone)]
 struct Properties {
-    x: u64,
-    y: u64,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
 }
 
 impl TsLatencyMeasure {
-    fn parse_time_code(
-        &self,
-        frame: &mut VideoFrameRef<&mut BufferRef>,
-        get_color: impl Fn(&[u8]) -> Option<bool>,
-    ) {
+    fn parse_time_code(&self, frame: &mut VideoFrameRef<&mut BufferRef>) -> Result<(), FlowError> {
         let Properties {
             x: start_x,
             y: start_y,
+            width: crop_width,
+            height: crop_height,
         } = *self.props.lock().unwrap();
 
         let curr_usecs = {
@@ -48,39 +54,72 @@ impl TsLatencyMeasure {
             time.useconds()
         };
 
-        let stride = frame.plane_stride()[0] as usize;
-        let nb_channels = frame.format_info().pixel_stride()[0] as usize;
-        let data = frame.plane_data_mut(0).unwrap();
+        let format = frame.format();
+        let format_info = frame.format_info();
+        let height_stride = frame.plane_stride()[0] as usize;
+        let width_stride = format_info.pixel_stride()[0] as usize;
+        let frame_height = frame.height();
+        let frame_width = frame.width();
+        let depth = format_info.depth()[0];
+        let data = frame.plane_data(0).unwrap();
 
-        let start_x = start_x as usize;
-        let start_y = start_y as usize;
-        let end_x = start_x + 8;
-        let end_y = start_y + 8;
-
-        let mut bitmap = [0u8; 8];
-
-        let lines = data[(start_y * stride)..(end_y * stride)].chunks_exact(stride);
-        for (line, byte) in lines.zip(&mut bitmap) {
-            let pixels =
-                line[(start_x * nb_channels)..(end_x * nb_channels)].chunks_exact(nb_channels);
-
-            *byte = pixels.enumerate().fold(0u8, |byte, (nth, pixel)| {
-                if get_color(pixel).unwrap() {
-                    byte | (1 << nth)
-                } else {
-                    byte
-                }
-            });
+        debug_assert_eq!(format, VideoFormat::Rgba);
+        if depth != 8 {
+            error!(
+                CAT,
+                imp: self,
+                "depth != 8 is not supported",
+            );
+            return Err(FlowError::NotSupported);
         }
 
-        let prev_usecs = u64::from_be_bytes(bitmap);
-        let diff_usecs = curr_usecs as i64 - prev_usecs as i64;
+        let code_image = {
+            let flat_samples = FlatSamples {
+                samples: data,
+                layout: SampleLayout {
+                    channels: 4,
+                    channel_stride: 1,
+                    width: frame_width,
+                    width_stride,
+                    height: frame_height,
+                    height_stride,
+                },
+                color_hint: None,
+            };
+            let view = flat_samples.as_view::<Rgba<u8>>().unwrap();
+            let crop = image::imageops::crop_imm(&view, start_x, start_y, crop_width, crop_height);
+            let crop = crop.inner();
+            let resize = image::imageops::resize(crop, 8, 8, FilterType::Nearest);
+            image::imageops::grayscale(&resize)
+        };
 
+        let mut bytes = [0; 8];
+        code_image
+            .rows()
+            .zip(&mut bytes)
+            .for_each(|(img_row, byte)| {
+                *byte = img_row
+                    .into_iter()
+                    .enumerate()
+                    .fold(0, |mut byte, (nth, pixel)| {
+                        let Luma([value]) = *pixel;
+                        if value >= 128 {
+                            byte |= 1 << nth;
+                        }
+                        byte
+                    });
+            });
+
+        let stamped_usecs: u64 = u64::from_be_bytes(bytes);
+
+        let diff_usecs = curr_usecs - stamped_usecs;
         info!(
             CAT,
             imp: self,
             "Delay {diff_usecs} usecs",
         );
+
+        Ok(())
     }
 }
 
@@ -95,7 +134,12 @@ impl Default for TsLatencyMeasure {
 
 impl Default for Properties {
     fn default() -> Self {
-        Self { x: 0, y: 0 }
+        Self {
+            x: DEFAULT_X,
+            y: DEFAULT_Y,
+            width: DEFAULT_WIDTH,
+            height: DEFAULT_HEIGHT,
+        }
     }
 }
 
@@ -136,7 +180,7 @@ impl ObjectImpl for TsLatencyMeasure {
                 info!(
                     CAT,
                     imp: self,
-                    "Changing hue-shift from {} to {}",
+                    "Changing x from {} to {}",
                     props.x,
                     x
                 );
@@ -148,11 +192,35 @@ impl ObjectImpl for TsLatencyMeasure {
                 info!(
                     CAT,
                     imp: self,
-                    "Changing hue-shift from {} to {}",
+                    "Changing y from {} to {}",
                     props.y,
                     y
                 );
                 props.y = y;
+            }
+            "width" => {
+                let mut props = self.props.lock().unwrap();
+                let width = value.get().expect("type checked upstream");
+                info!(
+                    CAT,
+                    imp: self,
+                    "Changing width from {} to {}",
+                    props.width,
+                    width
+                );
+                props.width = width;
+            }
+            "height" => {
+                let mut props = self.props.lock().unwrap();
+                let height = value.get().expect("type checked upstream");
+                info!(
+                    CAT,
+                    imp: self,
+                    "Changing y from {} to {}",
+                    props.height,
+                    height
+                );
+                props.height = height;
             }
             _ => unimplemented!(),
         }
@@ -167,6 +235,14 @@ impl ObjectImpl for TsLatencyMeasure {
             "y" => {
                 let props = self.props.lock().unwrap();
                 props.y.to_value()
+            }
+            "width" => {
+                let props = self.props.lock().unwrap();
+                props.width.to_value()
+            }
+            "height" => {
+                let props = self.props.lock().unwrap();
+                props.height.to_value()
             }
             _ => unimplemented!(),
         }
@@ -193,18 +269,7 @@ impl ElementImpl for TsLatencyMeasure {
         static PAD_TEMPLATES: Lazy<Vec<PadTemplate>> = Lazy::new(|| {
             // src pad capabilities
             let caps = VideoCapsBuilder::new()
-                .format_list([
-                    VideoFormat::Rgbx,
-                    VideoFormat::Xrgb,
-                    VideoFormat::Bgrx,
-                    VideoFormat::Xbgr,
-                    VideoFormat::Rgba,
-                    VideoFormat::Argb,
-                    VideoFormat::Bgra,
-                    VideoFormat::Abgr,
-                    VideoFormat::Rgb,
-                    VideoFormat::Bgr,
-                ])
+                .format_list([VideoFormat::Rgba])
                 .build();
 
             let src_pad_template =
@@ -231,55 +296,7 @@ impl VideoFilterImpl for TsLatencyMeasure {
         &self,
         frame: &mut VideoFrameRef<&mut BufferRef>,
     ) -> Result<FlowSuccess, FlowError> {
-        match frame.format() {
-            VideoFormat::Rgbx | VideoFormat::Rgb | VideoFormat::Bgrx | VideoFormat::Bgr => self
-                .parse_time_code(frame, |p| {
-                    Some(match p[0..3] {
-                        [255, 255, 255] => true,
-                        [0, 0, 0] => false,
-                        // _ => return None,
-                        _ => {
-                            // dbg!(&p[0..3]);
-                            false
-                        }
-                    })
-                }),
-            VideoFormat::Rgba | VideoFormat::Bgra => self.parse_time_code(frame, |p| {
-                Some(match p[0..4] {
-                    [255, 255, 255, 255] => true,
-                    [0, 0, 0, 255] => false,
-                    // _ => return None,
-                    _ => {
-                        // dbg!(&p[0..4]);
-                        false
-                    }
-                })
-            }),
-            VideoFormat::Xrgb | VideoFormat::Xbgr => self.parse_time_code(frame, |p| {
-                Some(match p[1..4] {
-                    [255, 255, 255] => true,
-                    [0, 0, 255] => false,
-                    // _ => return None,
-                    _ => {
-                        // dbg!(&p[1..4]);
-                        false
-                    }
-                })
-            }),
-            VideoFormat::Argb | VideoFormat::Abgr => self.parse_time_code(frame, |p| {
-                Some(match p[0..4] {
-                    [255, 255, 255, 255] => true,
-                    [255, 0, 0, 0] => false,
-                    // _ => return None,
-                    _ => {
-                        // dbg!(&p[0..4]);
-                        false
-                    }
-                })
-            }),
-            _ => unimplemented!(),
-        }
-
+        self.parse_time_code(frame)?;
         Ok(FlowSuccess::Ok)
     }
 }

@@ -8,6 +8,7 @@ cargo cbuild --release
 
 cd "$script_dir"
 export GST_PLUGIN_PATH="$PWD/../target/x86_64-unknown-linux-gnu/release:$GST_PLUGIN_PATH"
+export GST_DEBUG=tslatencystamper:4
 
 gst-launch-1.0 -v \
                videotestsrc \
