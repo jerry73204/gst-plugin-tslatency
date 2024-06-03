@@ -22,7 +22,7 @@ cargo cbuild
 
 ## Demo
 
-Modift the video receiver address.
+Modify the video receiver IP address.
 
 ```sh
 vim scripts/pub.sh
