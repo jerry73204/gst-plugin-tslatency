@@ -15,8 +15,8 @@ use std::sync::Mutex;
 
 const DEFAULT_X: u64 = 0;
 const DEFAULT_Y: u64 = 0;
-const DEFAULT_WIDTH: u64 = 256;
-const DEFAULT_HEIGHT: u64 = 256;
+const DEFAULT_WIDTH: u64 = 64;
+const DEFAULT_HEIGHT: u64 = 64;
 
 static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
     gst::DebugCategory::new(
@@ -40,7 +40,7 @@ struct Properties {
 }
 
 impl TsLatencyStamper {
-    fn time_code_overlay(
+    fn stamp_time_code(
         &self,
         frame: &mut VideoFrameRef<&mut BufferRef>,
         white: impl Fn(&mut [u8]),
@@ -57,19 +57,16 @@ impl TsLatencyStamper {
 
         let bitmap = {
             let mut bitmap = [[false; 8]; 8];
-            usecs
-                .to_be_bytes()
-                .into_iter()
-                .zip(&mut bitmap)
-                .for_each(|(byte, row)| {
-                    (0..u8::BITS)
-                        .map(|nth| 1 << nth)
-                        .map(|bit| (byte & bit) != 0)
-                        .zip(row)
-                        .for_each(|(bit, cell)| {
-                            *cell = bit;
-                        });
-                });
+            let bytes = usecs.to_be_bytes();
+            bytes.into_iter().zip(&mut bitmap).for_each(|(byte, row)| {
+                (0..u8::BITS)
+                    .map(|nth| 1 << nth)
+                    .map(|bit| (byte & bit) != 0)
+                    .zip(row)
+                    .for_each(|(bit, cell)| {
+                        *cell = bit;
+                    });
+            });
 
             bitmap
         };
@@ -77,28 +74,28 @@ impl TsLatencyStamper {
         let bitmap_h = bitmap.len();
         let bitmap_w = bitmap[0].len();
 
-        let stride = frame.plane_stride()[0] as usize;
-        let nb_channels = frame.format_info().pixel_stride()[0] as usize;
+        let height_stride = frame.plane_stride()[0] as usize;
+        let width_stride = frame.format_info().pixel_stride()[0] as usize;
         let data = frame.plane_data_mut(0).unwrap();
 
         let start_x = start_x as usize;
         let end_x = start_x + width as usize;
-        let col_range = (start_x * nb_channels)..(end_x * nb_channels);
+        let col_range = (start_x * width_stride)..(end_x * width_stride);
         let scale_x = bitmap_w as f32 / width as f32;
 
         let start_y = start_y as usize;
         let end_y = start_y + height as usize;
-        let row_range = (start_y * stride)..(end_y * stride);
+        let row_range = (start_y * height_stride)..(end_y * height_stride);
         let scale_y = bitmap_h as f32 / height as f32;
 
-        let lines = data[row_range].chunks_exact_mut(stride);
+        let lines = data[row_range].chunks_exact_mut(height_stride);
 
         let scale = |x: usize, scale: f32| -> usize {
             (((x as f32 + 0.5) * scale - 0.5).round() + 0.5) as usize
         };
 
         for (pr, line) in lines.enumerate() {
-            let pixels = line[col_range.clone()].chunks_exact_mut(nb_channels);
+            let pixels = line[col_range.clone()].chunks_exact_mut(width_stride);
             let br = scale(pr, scale_y).clamp(0, bitmap_h - 1);
             let bit_row = &bitmap[br];
 
@@ -314,7 +311,7 @@ impl VideoFilterImpl for TsLatencyStamper {
     ) -> Result<FlowSuccess, FlowError> {
         match frame.format() {
             VideoFormat::Rgbx | VideoFormat::Rgb | VideoFormat::Bgrx | VideoFormat::Bgr => self
-                .time_code_overlay(
+                .stamp_time_code(
                     frame,
                     |p| {
                         p[0..3].fill(255);
@@ -323,7 +320,7 @@ impl VideoFilterImpl for TsLatencyStamper {
                         p[0..3].fill(0);
                     },
                 ),
-            VideoFormat::Rgba | VideoFormat::Bgra => self.time_code_overlay(
+            VideoFormat::Rgba | VideoFormat::Bgra => self.stamp_time_code(
                 frame,
                 |p| {
                     p[0..4].fill(255);
@@ -332,7 +329,7 @@ impl VideoFilterImpl for TsLatencyStamper {
                     p[0..4].copy_from_slice(&[0, 0, 0, 255]);
                 },
             ),
-            VideoFormat::Xrgb | VideoFormat::Xbgr => self.time_code_overlay(
+            VideoFormat::Xrgb | VideoFormat::Xbgr => self.stamp_time_code(
                 frame,
                 |p| {
                     p[1..4].fill(255);
@@ -341,7 +338,7 @@ impl VideoFilterImpl for TsLatencyStamper {
                     p[1..4].fill(0);
                 },
             ),
-            VideoFormat::Argb | VideoFormat::Abgr => self.time_code_overlay(
+            VideoFormat::Argb | VideoFormat::Abgr => self.stamp_time_code(
                 frame,
                 |p| {
                     p[0..4].fill(255);
@@ -352,7 +349,6 @@ impl VideoFilterImpl for TsLatencyStamper {
             ),
             _ => unimplemented!(),
         }
-
         Ok(FlowSuccess::Ok)
     }
 }

@@ -10,14 +10,15 @@ use gst_video::{
     subclass::prelude::{BaseTransformImpl, VideoFilterImpl},
     VideoCapsBuilder, VideoFilter, VideoFormat, VideoFrameRef,
 };
-use image::{flat::SampleLayout, imageops::FilterType, FlatSamples, Luma, Rgba};
+use itertools::izip;
 use once_cell::sync::Lazy;
+use rayon::prelude::*;
 use std::sync::Mutex;
 
 const DEFAULT_X: u32 = 0;
 const DEFAULT_Y: u32 = 0;
-const DEFAULT_WIDTH: u32 = 256;
-const DEFAULT_HEIGHT: u32 = 256;
+const DEFAULT_WIDTH: u32 = 64;
+const DEFAULT_HEIGHT: u32 = 64;
 
 static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
     gst::DebugCategory::new(
@@ -41,7 +42,10 @@ struct Properties {
 }
 
 impl TsLatencyMeasure {
-    fn parse_time_code(&self, frame: &mut VideoFrameRef<&mut BufferRef>) -> Result<(), FlowError> {
+    fn measure_latency_using_time_code(
+        &self,
+        frame: &mut VideoFrameRef<&mut BufferRef>,
+    ) -> Result<(), FlowError> {
         let Properties {
             x: start_x,
             y: start_y,
@@ -58,8 +62,6 @@ impl TsLatencyMeasure {
         let format_info = frame.format_info();
         let height_stride = frame.plane_stride()[0] as usize;
         let width_stride = format_info.pixel_stride()[0] as usize;
-        let frame_height = frame.height();
-        let frame_width = frame.width();
         let depth = format_info.depth()[0];
         let data = frame.plane_data(0).unwrap();
 
@@ -73,42 +75,80 @@ impl TsLatencyMeasure {
             return Err(FlowError::NotSupported);
         }
 
-        let code_image = {
-            let flat_samples = FlatSamples {
-                samples: data,
-                layout: SampleLayout {
-                    channels: 4,
-                    channel_stride: 1,
-                    width: frame_width,
-                    width_stride,
-                    height: frame_height,
-                    height_stride,
-                },
-                color_hint: None,
+        let bitmap_h = 8;
+        let bitmap_w = 8;
+
+        let col_range = {
+            let start_x = start_x as usize;
+            let end_x = start_x + crop_width as usize;
+            (start_x * width_stride)..(end_x * width_stride)
+        };
+        let scale_x = bitmap_w as f32 / crop_width as f32;
+
+        let row_range = {
+            let start_y = start_y as usize;
+            let end_y = start_y + crop_height as usize;
+            (start_y * height_stride)..(end_y * height_stride)
+        };
+        let scale_y = bitmap_h as f32 / crop_height as f32;
+
+        let scale = |x: usize, scale: f32| -> usize {
+            (((x as f32 + 0.5) * scale - 0.5).round() + 0.5) as usize
+        };
+        let is_white = |rgba: &[u8]| {
+            let &[r, g, b, _a] = rgba else {
+                unreachable!();
             };
-            let view = flat_samples.as_view::<Rgba<u8>>().unwrap();
-            let crop = image::imageops::crop_imm(&view, start_x, start_y, crop_width, crop_height);
-            let crop = crop.inner();
-            let resize = image::imageops::resize(crop, 8, 8, FilterType::Nearest);
-            image::imageops::grayscale(&resize)
+            ((r as f32 + g as f32 + b as f32) / 3.0).round() as u8 >= 128
         };
 
-        let mut bytes = [0; 8];
-        code_image
-            .rows()
-            .zip(&mut bytes)
-            .for_each(|(img_row, byte)| {
-                *byte = img_row
-                    .into_iter()
-                    .enumerate()
-                    .fold(0, |mut byte, (nth, pixel)| {
-                        let Luma([value]) = *pixel;
-                        if value >= 128 {
-                            byte |= 1 << nth;
-                        }
-                        byte
-                    });
-            });
+        let freq = data[row_range]
+            .par_chunks_exact(height_stride)
+            .enumerate()
+            .flat_map(|(pr, line)| {
+                let pixels = line[col_range.clone()].par_chunks_exact(width_stride);
+                let br = scale(pr, scale_y).clamp(0, bitmap_h - 1);
+
+                pixels.enumerate().map(move |(pc, pixel)| {
+                    let bc = scale(pc, scale_x).clamp(0, bitmap_w - 1);
+                    let color = if is_white(pixel) { 1 } else { 0 };
+                    (br, bc, color)
+                })
+            })
+            .fold(
+                || [[[0, 0]; 8]; 8],
+                |mut freq, (br, bc, color)| {
+                    freq[br][bc][color] += 1;
+                    freq
+                },
+            )
+            .reduce_with(|mut lfreq, rfreq| {
+                for (lrow, rrow) in izip!(&mut lfreq, rfreq) {
+                    for (lcell, rcell) in izip!(lrow, rrow) {
+                        let [lf0, lf1] = lcell;
+                        let [rf0, rf1] = rcell;
+                        *lf0 += rf0;
+                        *lf1 += rf1;
+                    }
+                }
+                lfreq
+            })
+            .unwrap();
+
+        let mut bytes = [0u8; 8];
+
+        freq.into_iter().zip(&mut bytes).for_each(|(row, byte)| {
+            *byte = row
+                .into_iter()
+                .enumerate()
+                .fold(0, |mut byte, (nth, [freq0, freq1])| {
+                    let bit = freq1 > freq0;
+                    if bit {
+                        byte |= 1 << nth;
+                    }
+                    byte
+                });
+        });
 
         let stamped_usecs: u64 = u64::from_be_bytes(bytes);
 
@@ -296,7 +336,7 @@ impl VideoFilterImpl for TsLatencyMeasure {
         &self,
         frame: &mut VideoFrameRef<&mut BufferRef>,
     ) -> Result<FlowSuccess, FlowError> {
-        self.parse_time_code(frame)?;
+        self.measure_latency_using_time_code(frame)?;
         Ok(FlowSuccess::Ok)
     }
 }
