@@ -11,7 +11,13 @@ use gst_video::{
     VideoCapsBuilder, VideoFilter, VideoFormat, VideoFrameRef,
 };
 use once_cell::sync::Lazy;
+use qrcode_generator::QrCodeEcc;
 use std::sync::Mutex;
+
+const DEFAULT_X: u64 = 0;
+const DEFAULT_Y: u64 = 0;
+const DEFAULT_WIDTH: u64 = 256;
+const DEFAULT_HEIGHT: u64 = 256;
 
 static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
     gst::DebugCategory::new(
@@ -30,6 +36,8 @@ pub struct TsLatencyStamper {
 struct Properties {
     x: u64,
     y: u64,
+    width: u64,
+    height: u64,
 }
 
 impl TsLatencyStamper {
@@ -42,32 +50,45 @@ impl TsLatencyStamper {
         let Properties {
             x: start_x,
             y: start_y,
+            width,
+            height,
         } = *self.props.lock().unwrap();
 
-        let bitmap: [u8; 8] = {
-            let time = self.clock.time().unwrap();
-            let usecs = time.useconds();
-            usecs.to_be_bytes()
-        };
+        let time_string = self.clock.time().unwrap().useconds().to_string();
+        let bitmap = qrcode_generator::to_matrix(time_string, QrCodeEcc::Low).unwrap();
+        let bitmap_h = bitmap.len();
+        let bitmap_w = bitmap[0].len();
 
         let stride = frame.plane_stride()[0] as usize;
         let nb_channels = frame.format_info().pixel_stride()[0] as usize;
         let data = frame.plane_data_mut(0).unwrap();
 
         let start_x = start_x as usize;
+        let end_x = start_x + width as usize;
+        let col_range = (start_x * nb_channels)..(end_x * nb_channels);
+        let scale_x = bitmap_w as f32 / width as f32;
+
         let start_y = start_y as usize;
-        let end_x = start_x + 8;
-        let end_y = start_y + 8;
+        let end_y = start_y + height as usize;
+        let row_range = (start_y * stride)..(end_y * stride);
+        let scale_y = bitmap_h as f32 / height as f32;
 
-        let lines = data[(start_y * stride)..(end_y * stride)].chunks_exact_mut(stride);
+        let lines = data[row_range].chunks_exact_mut(stride);
 
-        for (line, byte) in lines.zip(bitmap) {
-            let pixels =
-                line[(start_x * nb_channels)..(end_x * nb_channels)].chunks_exact_mut(nb_channels);
+        let scale = |x: usize, scale: f32| -> usize {
+            (((x as f32 + 0.5) * scale - 0.5).round() + 0.5) as usize
+        };
 
-            for (nth, pixel) in pixels.enumerate() {
-                let color: bool = byte & (1 << nth) != 0;
-                if color {
+        for (pr, line) in lines.enumerate() {
+            let pixels = line[col_range.clone()].chunks_exact_mut(nb_channels);
+            let br = scale(pr, scale_y).clamp(0, bitmap_h - 1);
+            let bit_row = &bitmap[br];
+
+            for (pc, pixel) in pixels.enumerate() {
+                let bc = scale(pc, scale_x).clamp(0, bitmap_w - 1);
+                let bit = bit_row[bc];
+
+                if bit {
                     white(pixel);
                 } else {
                     black(pixel);
@@ -88,7 +109,12 @@ impl Default for TsLatencyStamper {
 
 impl Default for Properties {
     fn default() -> Self {
-        Self { x: 0, y: 0 }
+        Self {
+            x: DEFAULT_X,
+            y: DEFAULT_Y,
+            width: DEFAULT_WIDTH,
+            height: DEFAULT_HEIGHT,
+        }
     }
 }
 
@@ -105,14 +131,26 @@ impl ObjectImpl for TsLatencyStamper {
             vec![
                 glib::ParamSpecUInt64::builder("x")
                     .nick("x")
-                    .blurb("Binary time code X position")
-                    .default_value(0)
+                    .blurb("Time code X position")
+                    .default_value(DEFAULT_X)
                     .mutable_playing()
                     .build(),
                 glib::ParamSpecUInt64::builder("y")
                     .nick("y")
-                    .blurb("Binary time code Y position")
-                    .default_value(0)
+                    .blurb("Time code Y position")
+                    .default_value(DEFAULT_Y)
+                    .mutable_playing()
+                    .build(),
+                glib::ParamSpecUInt64::builder("width")
+                    .nick("w")
+                    .blurb("Time code width")
+                    .default_value(DEFAULT_WIDTH)
+                    .mutable_playing()
+                    .build(),
+                glib::ParamSpecUInt64::builder("height")
+                    .nick("h")
+                    .blurb("Time code height")
+                    .default_value(DEFAULT_HEIGHT)
                     .mutable_playing()
                     .build(),
             ]
@@ -129,7 +167,7 @@ impl ObjectImpl for TsLatencyStamper {
                 info!(
                     CAT,
                     imp: self,
-                    "Changing hue-shift from {} to {}",
+                    "Changing x from {} to {}",
                     props.x,
                     x
                 );
@@ -141,11 +179,35 @@ impl ObjectImpl for TsLatencyStamper {
                 info!(
                     CAT,
                     imp: self,
-                    "Changing hue-shift from {} to {}",
+                    "Changing y from {} to {}",
                     props.y,
                     y
                 );
                 props.y = y;
+            }
+            "width" => {
+                let mut props = self.props.lock().unwrap();
+                let width = value.get().expect("type checked upstream");
+                info!(
+                    CAT,
+                    imp: self,
+                    "Changing width from {} to {}",
+                    props.width,
+                    width
+                );
+                props.width = width;
+            }
+            "height" => {
+                let mut props = self.props.lock().unwrap();
+                let height = value.get().expect("type checked upstream");
+                info!(
+                    CAT,
+                    imp: self,
+                    "Changing height from {} to {}",
+                    props.height,
+                    height
+                );
+                props.height = height;
             }
             _ => unimplemented!(),
         }
@@ -160,6 +222,14 @@ impl ObjectImpl for TsLatencyStamper {
             "y" => {
                 let props = self.props.lock().unwrap();
                 props.y.to_value()
+            }
+            "width" => {
+                let props = self.props.lock().unwrap();
+                props.width.to_value()
+            }
+            "height" => {
+                let props = self.props.lock().unwrap();
+                props.height.to_value()
             }
             _ => unimplemented!(),
         }
