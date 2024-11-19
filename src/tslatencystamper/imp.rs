@@ -8,7 +8,7 @@ use gst_base::subclass::BaseTransformMode;
 use gst_video::{
     prelude::*,
     subclass::prelude::{BaseTransformImpl, VideoFilterImpl},
-    VideoCapsBuilder, VideoFilter, VideoFormat, VideoFrameRef,
+    VideoCapsBuilder, VideoFilter, VideoFormat, VideoFormatFlags, VideoFrameRef,
 };
 use itertools::{iproduct, izip};
 use once_cell::sync::Lazy;
@@ -41,79 +41,12 @@ struct Properties {
 }
 
 impl TsLatencyStamper {
-    fn stamp_time_code_rgb(
+    fn stamp_time_code(
         &self,
         frame: &mut VideoFrameRef<&mut BufferRef>,
-        white: impl Fn(&mut [u8]),
-        black: impl Fn(&mut [u8]),
-    ) {
-        let Properties {
-            x: start_x,
-            y: start_y,
-            width,
-            height,
-        } = *self.props.lock().unwrap();
-
-        let usecs = self.clock.time().unwrap().useconds();
-
-        let bitmap = {
-            let mut bitmap = [[false; 8]; 8];
-            let bytes = usecs.to_be_bytes();
-            bytes.into_iter().zip(&mut bitmap).for_each(|(byte, row)| {
-                (0..u8::BITS)
-                    .map(|nth| 1 << nth)
-                    .map(|bit| (byte & bit) != 0)
-                    .zip(row)
-                    .for_each(|(bit, cell)| {
-                        *cell = bit;
-                    });
-            });
-
-            bitmap
-        };
-
-        let bitmap_h = bitmap.len();
-        let bitmap_w = bitmap[0].len();
-
-        let height_stride = frame.plane_stride()[0] as usize;
-        let width_stride = frame.format_info().pixel_stride()[0] as usize;
-        let data = frame.plane_data_mut(0).unwrap();
-
-        let start_x = start_x as usize;
-        let end_x = start_x + width as usize;
-        let col_range = (start_x * width_stride)..(end_x * width_stride);
-        let scale_x = bitmap_w as f32 / width as f32;
-
-        let start_y = start_y as usize;
-        let end_y = start_y + height as usize;
-        let row_range = (start_y * height_stride)..(end_y * height_stride);
-        let scale_y = bitmap_h as f32 / height as f32;
-
-        let lines = data[row_range].chunks_exact_mut(height_stride);
-
-        let scale = |x: usize, scale: f32| -> usize {
-            (((x as f32 + 0.5) * scale - 0.5).round() + 0.5) as usize
-        };
-
-        for (pr, line) in lines.enumerate() {
-            let pixels = line[col_range.clone()].chunks_exact_mut(width_stride);
-            let br = scale(pr, scale_y).clamp(0, bitmap_h - 1);
-            let bit_row = &bitmap[br];
-
-            for (pc, pixel) in pixels.enumerate() {
-                let bc = scale(pc, scale_x).clamp(0, bitmap_w - 1);
-                let bit = bit_row[bc];
-
-                if bit {
-                    white(pixel);
-                } else {
-                    black(pixel);
-                }
-            }
-        }
-    }
-
-    fn stamp_time_code_yuv(&self, frame: &mut VideoFrameRef<&mut BufferRef>) {
+        white_fill: &[u8],
+        black_fill: &[u8],
+    ) -> Result<(), FlowError> {
         let Properties {
             x: start_x,
             y: start_y,
@@ -129,40 +62,63 @@ impl TsLatencyStamper {
             usecs.to_be_bytes()[row] & (1 << col) != 0
         };
 
-        let format_info = frame.format_info();
+        let fmt = frame.format_info();
         let row0 = start_y as usize;
         let rown = row0 + height as usize;
         let col0 = start_x as usize;
         let coln = col0 + width as usize;
 
-        let white_fills = [255, 128, 128];
-        let black_fills = [0, 128, 128];
+        let sub_scale = |val: usize, factor: u32| (-((-(val as i64)) >> factor)) as usize;
 
         for (ir, ic) in iproduct!(row0..rown, col0..coln) {
-            for (&pix, white_val, black_val) in izip!(format_info.plane(), white_fills, black_fills)
-            {
-                let pix = pix as usize;
-                let plane_stride = frame.plane_stride()[pix] as usize;
-                let pixel_stride = format_info.pixel_stride()[pix] as usize;
-                let depth = format_info.depth()[pix];
-                let shift = format_info.shift()[pix];
-                let plane_data = frame.plane_data_mut(pix as u32).unwrap();
-                assert!(depth == 8 && shift == 0);
+            let iter = izip!(
+                fmt.plane(),
+                fmt.pixel_stride(),
+                fmt.poffset(),
+                fmt.depth(),
+                fmt.shift(),
+                fmt.h_sub(),
+                fmt.w_sub(),
+                white_fill,
+                black_fill
+            );
 
-                let pr = ir >> format_info.h_sub()[pix];
-                let pc = ic >> format_info.w_sub()[pix];
-                let offset = pr * plane_stride + pc * pixel_stride;
+            for args in iter {
+                let (
+                    &plane_ix,
+                    &pixel_stride,
+                    &poffset,
+                    &depth,
+                    &shift,
+                    &h_sub,
+                    &w_sub,
+                    &white_val,
+                    &black_val,
+                ) = args;
+                if depth != 8 || shift != 0 {
+                    return Err(FlowError::NotSupported);
+                }
+
+                let plane_ix = plane_ix as usize;
+                let plane_stride = frame.plane_stride()[plane_ix] as usize;
+                let plane_data = frame.plane_data_mut(plane_ix as u32).unwrap();
+
+                let pr = sub_scale(ir, h_sub);
+                let pc = sub_scale(ic, w_sub);
+                let offset = pr * plane_stride + pc * pixel_stride as usize + poffset as usize;
                 let component = &mut plane_data[offset];
 
-                let br = ((ir - row0) as f32 + 0.5) / height as f32;
-                let bc = ((ic - col0) as f32 + 0.5) / width as f32;
-                *component = if get_bit(br, bc) {
+                let rr = ((ir - row0) as f32 + 0.5) / height as f32;
+                let rc = ((ic - col0) as f32 + 0.5) / width as f32;
+                *component = if get_bit(rr, rc) {
                     white_val
                 } else {
                     black_val
                 };
             }
         }
+
+        Ok(())
     }
 }
 
@@ -322,20 +278,14 @@ impl ElementImpl for TsLatencyStamper {
 
     fn pad_templates() -> &'static [PadTemplate] {
         static PAD_TEMPLATES: Lazy<Vec<PadTemplate>> = Lazy::new(|| {
+            use VideoFormat::*;
+
             // src pad capabilities
             let caps = VideoCapsBuilder::new()
                 .format_list([
-                    VideoFormat::Rgbx,
-                    VideoFormat::Xrgb,
-                    VideoFormat::Bgrx,
-                    VideoFormat::Xbgr,
-                    VideoFormat::Rgba,
-                    VideoFormat::Argb,
-                    VideoFormat::Bgra,
-                    VideoFormat::Abgr,
-                    VideoFormat::Rgb,
-                    VideoFormat::Bgr,
-                    VideoFormat::I420,
+                    Rgbx, Bgrx, Xrgb, Xbgr, Rgba, Bgra, Gbra, Argb, Abgr, Rgb, Bgr, Gbr, I420,
+                    Yv12, Yvyu, Vyuy, Uyvy, Yuy2, Ayuv, Y41b, Y42b, Nv12, Nv16, Nv21, Nv24, Nv61,
+                    A420, Yuv9, Yvu9, Iyu1,
                 ])
                 .build();
 
@@ -363,26 +313,17 @@ impl VideoFilterImpl for TsLatencyStamper {
         &self,
         frame: &mut VideoFrameRef<&mut BufferRef>,
     ) -> Result<FlowSuccess, FlowError> {
-        match frame.format() {
-            VideoFormat::Rgbx | VideoFormat::Rgb | VideoFormat::Bgrx | VideoFormat::Bgr => {
-                self.stamp_time_code_rgb(frame, |p| p[0..3].fill(255), |p| p[0..3].fill(0))
-            }
-            VideoFormat::Rgba | VideoFormat::Bgra => self.stamp_time_code_rgb(
-                frame,
-                |p| p[0..4].fill(255),
-                |p| p[0..4].copy_from_slice(&[0, 0, 0, 255]),
-            ),
-            VideoFormat::Xrgb | VideoFormat::Xbgr => {
-                self.stamp_time_code_rgb(frame, |p| p[1..4].fill(255), |p| p[1..4].fill(0))
-            }
-            VideoFormat::Argb | VideoFormat::Abgr => self.stamp_time_code_rgb(
-                frame,
-                |p| p[0..4].fill(255),
-                |p| p[0..4].copy_from_slice(&[255, 0, 0, 0]),
-            ),
-            VideoFormat::I420 => self.stamp_time_code_yuv(frame),
-            _ => unimplemented!(),
+        let fmt = frame.format_info();
+        let flags = fmt.flags();
+
+        if flags.contains(VideoFormatFlags::RGB) {
+            self.stamp_time_code(frame, &[255, 255, 255], &[0, 0, 0])?;
+        } else if flags.contains(VideoFormatFlags::YUV) {
+            self.stamp_time_code(frame, &[255, 128, 128], &[0, 128, 128])?;
+        } else {
+            return Err(FlowError::NotSupported);
         }
+
         Ok(FlowSuccess::Ok)
     }
 }
