@@ -12,10 +12,8 @@ export GST_DEBUG=tslatencystamper:4
 
 gst-launch-1.0 -v \
                videotestsrc \
-               ! 'video/x-raw,width=1920,height=1080,format=(string)BGRx' \
+               ! 'video/x-raw,width=1920,height=1080,format=(string)I420' \
                ! tslatencystamper \
-               ! videoconvert \
                ! x264enc \
                ! rtph264pay \
                ! udpsink host=127.0.0.1 port=5000
-
