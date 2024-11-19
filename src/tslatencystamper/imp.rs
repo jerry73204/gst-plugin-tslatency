@@ -56,11 +56,7 @@ impl TsLatencyStamper {
 
         // Get the current timestamp
         let usecs = self.clock.time().unwrap().useconds();
-        let get_bit = |r: f32, c: f32| {
-            let row = (r * 8.0 - 0.5).round().clamp(0.0, 7.0) as usize;
-            let col = (c * 8.0 - 0.5).round().clamp(0.0, 7.0) as usize;
-            usecs.to_be_bytes()[row] & (1 << col) != 0
-        };
+        let get_bit = |r: usize, c: usize| (usecs.to_be_bytes()[r] & (1 << c)) != 0;
 
         let fmt = frame.format_info();
         let row0 = start_y as usize;
@@ -110,7 +106,10 @@ impl TsLatencyStamper {
 
                 let rr = ((ir - row0) as f32 + 0.5) / height as f32;
                 let rc = ((ic - col0) as f32 + 0.5) / width as f32;
-                *component = if get_bit(rr, rc) {
+                let br = (rr * 8.0 - 0.5).round().clamp(0.0, 7.0) as usize;
+                let bc = (rc * 8.0 - 0.5).round().clamp(0.0, 7.0) as usize;
+
+                *component = if get_bit(br, bc) {
                     white_val
                 } else {
                     black_val

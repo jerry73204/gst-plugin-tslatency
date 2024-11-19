@@ -8,17 +8,17 @@ use gst_base::subclass::BaseTransformMode;
 use gst_video::{
     prelude::*,
     subclass::prelude::{BaseTransformImpl, VideoFilterImpl},
-    VideoCapsBuilder, VideoFilter, VideoFormat, VideoFrameRef,
+    VideoCapsBuilder, VideoFilter, VideoFormat, VideoFormatFlags, VideoFrameRef,
 };
-use itertools::izip;
+use itertools::{iproduct, izip};
 use once_cell::sync::Lazy;
-use rayon::prelude::*;
 use std::sync::Mutex;
 
 const DEFAULT_X: u32 = 0;
 const DEFAULT_Y: u32 = 0;
 const DEFAULT_WIDTH: u32 = 64;
 const DEFAULT_HEIGHT: u32 = 64;
+const DEFAULT_TOLERANCE: u32 = 5;
 
 static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
     gst::DebugCategory::new(
@@ -39,117 +39,122 @@ struct Properties {
     y: u32,
     width: u32,
     height: u32,
+    tolerance: u32,
 }
 
 impl TsLatencyMeasure {
     fn measure_latency_using_time_code(
         &self,
         frame: &mut VideoFrameRef<&mut BufferRef>,
+        white_fill: &[u8],
+        black_fill: &[u8],
     ) -> Result<(), FlowError> {
         let Properties {
             x: start_x,
             y: start_y,
             width: crop_width,
             height: crop_height,
+            tolerance,
         } = *self.props.lock().unwrap();
 
-        let curr_usecs = {
-            let time = self.clock.time().unwrap();
-            time.useconds()
-        };
+        let curr_usecs = self.clock.time().unwrap().useconds();
+        let fmt = frame.format_info();
 
-        let format = frame.format();
-        let format_info = frame.format_info();
-        let height_stride = frame.plane_stride()[0] as usize;
-        let width_stride = format_info.pixel_stride()[0] as usize;
-        let depth = format_info.depth()[0];
-        let data = frame.plane_data(0).unwrap();
-
-        debug_assert_eq!(format, VideoFormat::Rgba);
-        if depth != 8 {
+        if fmt.bits() != 8 {
             error!(
                 CAT,
                 imp: self,
-                "depth != 8 is not supported",
+                "bits != 8 is not supported",
             );
             return Err(FlowError::NotSupported);
         }
 
-        let bitmap_h = 8;
-        let bitmap_w = 8;
+        let row0 = start_y as usize;
+        let rown = row0 + crop_height as usize;
+        let col0 = start_x as usize;
+        let coln = col0 + crop_width as usize;
 
-        let col_range = {
-            let start_x = start_x as usize;
-            let end_x = start_x + crop_width as usize;
-            (start_x * width_stride)..(end_x * width_stride)
-        };
-        let scale_x = bitmap_w as f32 / crop_width as f32;
+        let abs_diff = |a: u8, b: u8| a.checked_sub(b).unwrap_or_else(|| b - a);
+        let sub_scale = |val: usize, factor: u32| (-((-(val as i64)) >> factor)) as usize;
 
-        let row_range = {
-            let start_y = start_y as usize;
-            let end_y = start_y + crop_height as usize;
-            (start_y * height_stride)..(end_y * height_stride)
-        };
-        let scale_y = bitmap_h as f32 / crop_height as f32;
+        // The white/black counts per bit in the 8x8 bitmap, indexed
+        // by row, column and color code. Color code is 1 if white,
+        // otherwise 0.
+        let counts =
+            iproduct!(row0..rown, col0..coln).fold([[[0; 2]; 8]; 8], |mut counts, (ir, ic)| {
+                let mut white_votes = 0;
+                let mut black_votes = 0;
 
-        let scale = |x: usize, scale: f32| -> usize {
-            (((x as f32 + 0.5) * scale - 0.5).round() + 0.5) as usize
-        };
-        let is_white = |rgba: &[u8]| {
-            let &[r, g, b, _a] = rgba else {
-                unreachable!();
-            };
-            ((r as f32 + g as f32 + b as f32) / 3.0).round() as u8 >= 128
-        };
+                for args in izip!(
+                    fmt.plane(),
+                    fmt.pixel_stride(),
+                    fmt.poffset(),
+                    fmt.depth(),
+                    fmt.shift(),
+                    fmt.h_sub(),
+                    fmt.w_sub(),
+                    white_fill,
+                    black_fill
+                ) {
+                    let (
+                        &plane_ix,
+                        &pixel_stride,
+                        &poffset,
+                        _depth,
+                        _shift,
+                        &h_sub,
+                        &w_sub,
+                        &white_val,
+                        &black_val,
+                    ) = args;
 
-        let freq = data[row_range]
-            .par_chunks_exact(height_stride)
-            .enumerate()
-            .flat_map(|(pr, line)| {
-                let pixels = line[col_range.clone()].par_chunks_exact(width_stride);
-                let br = scale(pr, scale_y).clamp(0, bitmap_h - 1);
+                    let plane_ix = plane_ix as usize;
+                    let plane_stride = frame.plane_stride()[plane_ix] as usize;
+                    let plane_data = frame.plane_data(plane_ix as u32).unwrap();
 
-                pixels.enumerate().map(move |(pc, pixel)| {
-                    let bc = scale(pc, scale_x).clamp(0, bitmap_w - 1);
-                    let color = if is_white(pixel) { 1 } else { 0 };
-                    (br, bc, color)
-                })
-            })
-            .fold(
-                || [[[0, 0]; 8]; 8],
-                |mut freq, (br, bc, color)| {
-                    freq[br][bc][color] += 1;
-                    freq
-                },
-            )
-            .reduce_with(|mut lfreq, rfreq| {
-                for (lrow, rrow) in izip!(&mut lfreq, rfreq) {
-                    for (lcell, rcell) in izip!(lrow, rrow) {
-                        let [lf0, lf1] = lcell;
-                        let [rf0, rf1] = rcell;
-                        *lf0 += rf0;
-                        *lf1 += rf1;
+                    let pr = sub_scale(ir, h_sub);
+                    let pc = sub_scale(ic, w_sub);
+                    let offset = pr * plane_stride + pc * pixel_stride as usize + poffset as usize;
+                    let component = plane_data[offset];
+
+                    if (abs_diff(component, white_val) as u32) < tolerance {
+                        white_votes += 1;
+                    }
+                    if (abs_diff(component, black_val) as u32) < tolerance {
+                        black_votes += 1;
                     }
                 }
-                lfreq
-            })
-            .unwrap();
 
-        let mut bytes = [0u8; 8];
+                let rr = ((ir - row0) as f32 + 0.5) / crop_height as f32;
+                let rc = ((ic - col0) as f32 + 0.5) / crop_width as f32;
 
-        freq.into_iter().zip(&mut bytes).for_each(|(row, byte)| {
-            *byte = row
-                .into_iter()
-                .enumerate()
-                .fold(0, |mut byte, (nth, [freq0, freq1])| {
-                    let bit = freq1 > freq0;
-                    if bit {
-                        byte |= 1 << nth;
-                    }
-                    byte
-                });
-        });
+                let br = (rr * 8.0 - 0.5).round().clamp(0.0, 7.0) as usize;
+                let bc = (rc * 8.0 - 0.5).round().clamp(0.0, 7.0) as usize;
 
+                if white_votes == fmt.n_components() {
+                    counts[br][bc][1] += 1;
+                }
+                if black_votes == fmt.n_components() {
+                    counts[br][bc][0] += 1;
+                }
+
+                counts
+            });
+        let bytes = {
+            let mut bytes = [0u8; 8];
+            counts.into_iter().zip(&mut bytes).for_each(|(row, byte)| {
+                *byte = row
+                    .into_iter()
+                    .enumerate()
+                    .fold(0, |mut byte, (nth, [freq0, freq1])| {
+                        if freq1 > freq0 {
+                            byte |= 1 << nth;
+                        }
+                        byte
+                    });
+            });
+            bytes
+        };
         let stamped_usecs: u64 = u64::from_be_bytes(bytes);
 
         let diff_usecs = curr_usecs - stamped_usecs;
@@ -179,6 +184,7 @@ impl Default for Properties {
             y: DEFAULT_Y,
             width: DEFAULT_WIDTH,
             height: DEFAULT_HEIGHT,
+            tolerance: DEFAULT_TOLERANCE,
         }
     }
 }
@@ -262,6 +268,18 @@ impl ObjectImpl for TsLatencyMeasure {
                 );
                 props.height = height;
             }
+            "tolerance" => {
+                let mut props = self.props.lock().unwrap();
+                let tolerance = value.get().expect("type checked upstream");
+                info!(
+                    CAT,
+                    imp: self,
+                    "Changing tolerance from {} to {}",
+                    props.tolerance,
+                    tolerance
+                );
+                props.tolerance = tolerance;
+            }
             _ => unimplemented!(),
         }
     }
@@ -283,6 +301,10 @@ impl ObjectImpl for TsLatencyMeasure {
             "height" => {
                 let props = self.props.lock().unwrap();
                 props.height.to_value()
+            }
+            "tolerance" => {
+                let props = self.props.lock().unwrap();
+                props.tolerance.to_value()
             }
             _ => unimplemented!(),
         }
@@ -307,9 +329,15 @@ impl ElementImpl for TsLatencyMeasure {
 
     fn pad_templates() -> &'static [PadTemplate] {
         static PAD_TEMPLATES: Lazy<Vec<PadTemplate>> = Lazy::new(|| {
+            use VideoFormat::*;
+
             // src pad capabilities
             let caps = VideoCapsBuilder::new()
-                .format_list([VideoFormat::Rgba])
+                .format_list([
+                    Rgbx, Bgrx, Xrgb, Xbgr, Rgba, Bgra, Gbra, Argb, Abgr, Rgb, Bgr, Gbr, I420,
+                    Yv12, Yvyu, Vyuy, Uyvy, Yuy2, Ayuv, Y41b, Y42b, Nv12, Nv16, Nv21, Nv24, Nv61,
+                    A420, Yuv9, Yvu9, Iyu1,
+                ])
                 .build();
 
             let src_pad_template =
@@ -336,7 +364,17 @@ impl VideoFilterImpl for TsLatencyMeasure {
         &self,
         frame: &mut VideoFrameRef<&mut BufferRef>,
     ) -> Result<FlowSuccess, FlowError> {
-        self.measure_latency_using_time_code(frame)?;
+        let fmt = frame.format_info();
+        let flags = fmt.flags();
+
+        if flags.contains(VideoFormatFlags::RGB) {
+            self.measure_latency_using_time_code(frame, &[255, 255, 255], &[0, 0, 0])?;
+        } else if flags.contains(VideoFormatFlags::YUV) {
+            self.measure_latency_using_time_code(frame, &[255, 128, 128], &[0, 128, 128])?;
+        } else {
+            return Err(FlowError::NotSupported);
+        }
+
         Ok(FlowSuccess::Ok)
     }
 }
