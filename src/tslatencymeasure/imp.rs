@@ -19,6 +19,7 @@ const DEFAULT_Y: u32 = 0;
 const DEFAULT_WIDTH: u32 = 64;
 const DEFAULT_HEIGHT: u32 = 64;
 const DEFAULT_TOLERANCE: u32 = 5;
+const DEFAULT_OUTPUT_JITTER: bool = false;
 
 static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
     gst::DebugCategory::new(
@@ -31,6 +32,8 @@ static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
 pub struct TsLatencyMeasure {
     props: Mutex<Properties>,
     clock: Clock,
+    jitter: Mutex<f64>,
+    prev_diff_usecs: Mutex<u64>,
 }
 
 #[derive(Clone)]
@@ -40,6 +43,7 @@ struct Properties {
     width: u32,
     height: u32,
     tolerance: u32,
+    output_jitter: bool,
 }
 
 impl TsLatencyMeasure {
@@ -55,6 +59,7 @@ impl TsLatencyMeasure {
             width: crop_width,
             height: crop_height,
             tolerance,
+            output_jitter,
         } = *self.props.lock().unwrap();
 
         let curr_usecs = self.clock.time().unwrap().useconds();
@@ -158,11 +163,30 @@ impl TsLatencyMeasure {
         let stamped_usecs: u64 = u64::from_be_bytes(bytes);
 
         let diff_usecs = curr_usecs - stamped_usecs;
-        info!(
-            CAT,
-            imp: self,
-            "Delay {diff_usecs} usecs",
-        );
+
+        let mut prev_diff_usecs = self.prev_diff_usecs.lock().unwrap();
+        let previous_delay = *prev_diff_usecs;
+        *prev_diff_usecs = diff_usecs;
+        let diff_delta = diff_usecs as i64 - previous_delay as i64;
+
+        let mut jitter = self.jitter.lock().unwrap();
+        *jitter += ((diff_delta.abs() as f64) - *jitter) / 16.0;
+        let jitter_value = *jitter;
+
+        if output_jitter {
+            info!(
+                CAT,
+                imp: self,
+                "Delay {diff_usecs} usecs, Jitter {:.6} usecs",
+                jitter_value
+            );
+        } else {
+            info!(
+                CAT,
+                imp: self,
+                "Delay {diff_usecs} usecs",
+            );
+        }
 
         Ok(())
     }
@@ -173,6 +197,8 @@ impl Default for TsLatencyMeasure {
         Self {
             props: Mutex::new(Properties::default()),
             clock: SystemClock::obtain(),
+            jitter: Mutex::new(0.0),
+            prev_diff_usecs:Mutex::new(0),
         }
     }
 }
@@ -185,6 +211,7 @@ impl Default for Properties {
             width: DEFAULT_WIDTH,
             height: DEFAULT_HEIGHT,
             tolerance: DEFAULT_TOLERANCE,
+            output_jitter: DEFAULT_OUTPUT_JITTER,
         }
     }
 }
@@ -210,6 +237,12 @@ impl ObjectImpl for TsLatencyMeasure {
                     .nick("y")
                     .blurb("Binary time code Y position")
                     .default_value(0)
+                    .mutable_playing()
+                    .build(),
+                glib::ParamSpecBoolean::builder("output-jitter")
+                    .nick("Output Jitter")
+                    .blurb("Enable or disable jitter output")
+                    .default_value(DEFAULT_OUTPUT_JITTER)
                     .mutable_playing()
                     .build(),
             ]
@@ -280,6 +313,18 @@ impl ObjectImpl for TsLatencyMeasure {
                 );
                 props.tolerance = tolerance;
             }
+            "output-jitter" => {
+                let mut props = self.props.lock().unwrap();
+                let output_jitter = value.get().expect("type checked upstream");
+                info!(
+                    CAT,
+                    imp: self,
+                    "Changing output-jitter from {} to {}",
+                    props.output_jitter,
+                    output_jitter
+                );
+                props.output_jitter = output_jitter;
+            }
             _ => unimplemented!(),
         }
     }
@@ -306,6 +351,10 @@ impl ObjectImpl for TsLatencyMeasure {
                 let props = self.props.lock().unwrap();
                 props.tolerance.to_value()
             }
+            "output-jitter" => {
+                let props = self.props.lock().unwrap();
+                props.output_jitter.to_value()
+            }
             _ => unimplemented!(),
         }
     }
@@ -317,7 +366,7 @@ impl ElementImpl for TsLatencyMeasure {
     fn metadata() -> Option<&'static ElementMetadata> {
         static ELEMENT_METADATA: Lazy<ElementMetadata> = Lazy::new(|| {
             ElementMetadata::new(
-                "latency measurement using  binary time code",
+                "latency measurement using binary time code",
                 "Filter/Effect/Converter/Video",
                 "Measure latency using binary time code stamped on frames",
                 "Jerry Lin <jerry73204@gmail.com>",
