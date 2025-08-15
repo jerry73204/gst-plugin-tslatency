@@ -14,6 +14,10 @@ gst-launch-1.0 -v \
                videotestsrc \
                ! 'video/x-raw,width=1920,height=1080,format=(string)I420' \
                ! tslatencystamper \
+               ! nvvideoconvert \
+               ! nvv4l2h265enc \
+               ! nvv4l2decoder \
+               ! nvvideoconvert \
                ! tslatencymeasure \
                ! autovideosink
 

@@ -16,4 +16,4 @@ gst-launch-1.0 -v \
                ! nvv4l2decoder \
                ! nvvideoconvert \
                ! tslatencymeasure \
-               ! fakesink
+               ! autovideosink
