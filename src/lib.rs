@@ -1,3 +1,4 @@
+mod stamper;
 mod tslatencymeasure;
 mod tslatencystamper;
 

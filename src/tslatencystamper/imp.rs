@@ -1,3 +1,4 @@
+use crate::stamper::{create_stamper, StamperConfig, StamperType, TimestampStamper};
 use glib::subclass::{prelude::*, types::ObjectSubclass};
 use gst::{
     info,
@@ -8,9 +9,8 @@ use gst_base::subclass::BaseTransformMode;
 use gst_video::{
     prelude::*,
     subclass::prelude::{BaseTransformImpl, VideoFilterImpl},
-    VideoCapsBuilder, VideoFilter, VideoFormat, VideoFormatFlags, VideoFrameRef,
+    VideoCapsBuilder, VideoFilter, VideoFormat, VideoFrameRef,
 };
-use itertools::{iproduct, izip};
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
 
@@ -30,6 +30,7 @@ static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
 pub struct TsLatencyStamper {
     props: Mutex<Properties>,
     clock: Clock,
+    stamper: Mutex<Box<dyn TimestampStamper>>,
 }
 
 #[derive(Clone)]
@@ -38,94 +39,16 @@ struct Properties {
     y: u64,
     width: u64,
     height: u64,
-}
-
-impl TsLatencyStamper {
-    fn stamp_time_code(
-        &self,
-        frame: &mut VideoFrameRef<&mut BufferRef>,
-        white_fill: &[u8],
-        black_fill: &[u8],
-    ) -> Result<(), FlowError> {
-        let Properties {
-            x: start_x,
-            y: start_y,
-            width,
-            height,
-        } = *self.props.lock().unwrap();
-
-        // Get the current timestamp
-        let usecs = self.clock.time().unwrap().useconds();
-        let get_bit = |r: usize, c: usize| (usecs.to_be_bytes()[r] & (1 << c)) != 0;
-
-        let fmt = frame.format_info();
-        let row0 = start_y as usize;
-        let rown = row0 + height as usize;
-        let col0 = start_x as usize;
-        let coln = col0 + width as usize;
-
-        let sub_scale = |val: usize, factor: u32| (-((-(val as i64)) >> factor)) as usize;
-
-        for (ir, ic) in iproduct!(row0..rown, col0..coln) {
-            let iter = izip!(
-                fmt.plane(),
-                fmt.pixel_stride(),
-                fmt.poffset(),
-                fmt.depth(),
-                fmt.shift(),
-                fmt.h_sub(),
-                fmt.w_sub(),
-                white_fill,
-                black_fill
-            );
-
-            for args in iter {
-                let (
-                    &plane_ix,
-                    &pixel_stride,
-                    &poffset,
-                    &depth,
-                    &shift,
-                    &h_sub,
-                    &w_sub,
-                    &white_val,
-                    &black_val,
-                ) = args;
-                if depth != 8 || shift != 0 {
-                    return Err(FlowError::NotSupported);
-                }
-
-                let plane_ix = plane_ix as usize;
-                let plane_stride = frame.plane_stride()[plane_ix] as usize;
-                let plane_data = frame.plane_data_mut(plane_ix as u32).unwrap();
-
-                let pr = sub_scale(ir, h_sub);
-                let pc = sub_scale(ic, w_sub);
-                let offset = pr * plane_stride + pc * pixel_stride as usize + poffset as usize;
-                let component = &mut plane_data[offset];
-
-                let rr = ((ir - row0) as f32 + 0.5) / height as f32;
-                let rc = ((ic - col0) as f32 + 0.5) / width as f32;
-                let br = (rr * 8.0 - 0.5).round().clamp(0.0, 7.0) as usize;
-                let bc = (rc * 8.0 - 0.5).round().clamp(0.0, 7.0) as usize;
-
-                *component = if get_bit(br, bc) {
-                    white_val
-                } else {
-                    black_val
-                };
-            }
-        }
-
-        Ok(())
-    }
+    stamper_type: StamperType,
 }
 
 impl Default for TsLatencyStamper {
     fn default() -> Self {
+        let stamper_type = StamperType::default();
         Self {
             props: Mutex::new(Properties::default()),
             clock: SystemClock::obtain(),
+            stamper: Mutex::new(create_stamper(stamper_type)),
         }
     }
 }
@@ -137,6 +60,7 @@ impl Default for Properties {
             y: DEFAULT_Y,
             width: DEFAULT_WIDTH,
             height: DEFAULT_HEIGHT,
+            stamper_type: StamperType::default(),
         }
     }
 }
@@ -175,6 +99,12 @@ impl ObjectImpl for TsLatencyStamper {
                     .blurb("Time code height")
                     .default_value(DEFAULT_HEIGHT)
                     .mutable_playing()
+                    .build(),
+                glib::ParamSpecEnum::builder::<StamperType>("stamper-type")
+                    .nick("Stamper Type")
+                    .blurb("Type of timestamp stamper to use")
+                    .default_value(StamperType::default())
+                    .mutable_ready()
                     .build(),
             ]
         });
@@ -232,6 +162,18 @@ impl ObjectImpl for TsLatencyStamper {
                 );
                 props.height = height;
             }
+            "stamper-type" => {
+                let mut props = self.props.lock().unwrap();
+                let stamper_type = value.get().expect("type checked upstream");
+                info!(
+                    CAT,
+                    imp: self,
+                    "Changing stamper type to {:?}",
+                    stamper_type
+                );
+                props.stamper_type = stamper_type;
+                *self.stamper.lock().unwrap() = create_stamper(stamper_type);
+            }
             _ => unimplemented!(),
         }
     }
@@ -253,6 +195,10 @@ impl ObjectImpl for TsLatencyStamper {
             "height" => {
                 let props = self.props.lock().unwrap();
                 props.height.to_value()
+            }
+            "stamper-type" => {
+                let props = self.props.lock().unwrap();
+                props.stamper_type.to_value()
             }
             _ => unimplemented!(),
         }
@@ -312,16 +258,17 @@ impl VideoFilterImpl for TsLatencyStamper {
         &self,
         frame: &mut VideoFrameRef<&mut BufferRef>,
     ) -> Result<FlowSuccess, FlowError> {
-        let fmt = frame.format_info();
-        let flags = fmt.flags();
+        let props = self.props.lock().unwrap();
+        let config = StamperConfig {
+            x: props.x as u32,
+            y: props.y as u32,
+            width: props.width as u32,
+            height: props.height as u32,
+        };
+        drop(props);
 
-        if flags.contains(VideoFormatFlags::RGB) {
-            self.stamp_time_code(frame, &[255, 255, 255], &[0, 0, 0])?;
-        } else if flags.contains(VideoFormatFlags::YUV) {
-            self.stamp_time_code(frame, &[255, 128, 128], &[0, 128, 128])?;
-        } else {
-            return Err(FlowError::NotSupported);
-        }
+        let stamper = self.stamper.lock().unwrap();
+        stamper.stamp(frame, &self.clock, &config)?;
 
         Ok(FlowSuccess::Ok)
     }

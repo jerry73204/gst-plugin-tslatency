@@ -1,3 +1,4 @@
+use crate::stamper::{create_reader, ReaderConfig, StamperType, TimestampReader};
 use glib::subclass::{prelude::*, types::ObjectSubclass};
 use gst::{
     error, info,
@@ -8,9 +9,8 @@ use gst_base::subclass::BaseTransformMode;
 use gst_video::{
     prelude::*,
     subclass::prelude::{BaseTransformImpl, VideoFilterImpl},
-    VideoCapsBuilder, VideoFilter, VideoFormat, VideoFormatFlags, VideoFrameRef,
+    VideoCapsBuilder, VideoFilter, VideoFormat, VideoFrameRef,
 };
-use itertools::{iproduct, izip};
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
 
@@ -31,6 +31,7 @@ static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
 pub struct TsLatencyMeasure {
     props: Mutex<Properties>,
     clock: Clock,
+    reader: Mutex<Box<dyn TimestampReader>>,
 }
 
 #[derive(Clone)]
@@ -40,139 +41,16 @@ struct Properties {
     width: u32,
     height: u32,
     tolerance: u32,
-}
-
-impl TsLatencyMeasure {
-    fn measure_latency_using_time_code(
-        &self,
-        frame: &mut VideoFrameRef<&mut BufferRef>,
-        white_fill: &[u8],
-        black_fill: &[u8],
-    ) -> Result<(), FlowError> {
-        let Properties {
-            x: start_x,
-            y: start_y,
-            width: crop_width,
-            height: crop_height,
-            tolerance,
-        } = *self.props.lock().unwrap();
-
-        let curr_usecs = self.clock.time().unwrap().useconds();
-        let fmt = frame.format_info();
-
-        if fmt.bits() != 8 {
-            error!(
-                CAT,
-                imp: self,
-                "bits != 8 is not supported",
-            );
-            return Err(FlowError::NotSupported);
-        }
-
-        let row0 = start_y as usize;
-        let rown = row0 + crop_height as usize;
-        let col0 = start_x as usize;
-        let coln = col0 + crop_width as usize;
-
-        let abs_diff = |a: u8, b: u8| a.checked_sub(b).unwrap_or_else(|| b - a);
-        let sub_scale = |val: usize, factor: u32| (-((-(val as i64)) >> factor)) as usize;
-
-        // The white/black counts per bit in the 8x8 bitmap, indexed
-        // by row, column and color code. Color code is 1 if white,
-        // otherwise 0.
-        let counts =
-            iproduct!(row0..rown, col0..coln).fold([[[0; 2]; 8]; 8], |mut counts, (ir, ic)| {
-                let mut white_votes = 0;
-                let mut black_votes = 0;
-
-                for args in izip!(
-                    fmt.plane(),
-                    fmt.pixel_stride(),
-                    fmt.poffset(),
-                    fmt.depth(),
-                    fmt.shift(),
-                    fmt.h_sub(),
-                    fmt.w_sub(),
-                    white_fill,
-                    black_fill
-                ) {
-                    let (
-                        &plane_ix,
-                        &pixel_stride,
-                        &poffset,
-                        _depth,
-                        _shift,
-                        &h_sub,
-                        &w_sub,
-                        &white_val,
-                        &black_val,
-                    ) = args;
-
-                    let plane_ix = plane_ix as usize;
-                    let plane_stride = frame.plane_stride()[plane_ix] as usize;
-                    let plane_data = frame.plane_data(plane_ix as u32).unwrap();
-
-                    let pr = sub_scale(ir, h_sub);
-                    let pc = sub_scale(ic, w_sub);
-                    let offset = pr * plane_stride + pc * pixel_stride as usize + poffset as usize;
-                    let component = plane_data[offset];
-
-                    if (abs_diff(component, white_val) as u32) < tolerance {
-                        white_votes += 1;
-                    }
-                    if (abs_diff(component, black_val) as u32) < tolerance {
-                        black_votes += 1;
-                    }
-                }
-
-                let rr = ((ir - row0) as f32 + 0.5) / crop_height as f32;
-                let rc = ((ic - col0) as f32 + 0.5) / crop_width as f32;
-
-                let br = (rr * 8.0 - 0.5).round().clamp(0.0, 7.0) as usize;
-                let bc = (rc * 8.0 - 0.5).round().clamp(0.0, 7.0) as usize;
-
-                if white_votes == fmt.n_components() {
-                    counts[br][bc][1] += 1;
-                }
-                if black_votes == fmt.n_components() {
-                    counts[br][bc][0] += 1;
-                }
-
-                counts
-            });
-        let bytes = {
-            let mut bytes = [0u8; 8];
-            counts.into_iter().zip(&mut bytes).for_each(|(row, byte)| {
-                *byte = row
-                    .into_iter()
-                    .enumerate()
-                    .fold(0, |mut byte, (nth, [freq0, freq1])| {
-                        if freq1 > freq0 {
-                            byte |= 1 << nth;
-                        }
-                        byte
-                    });
-            });
-            bytes
-        };
-        let stamped_usecs: u64 = u64::from_be_bytes(bytes);
-
-        let diff_usecs = curr_usecs - stamped_usecs;
-        info!(
-            CAT,
-            imp: self,
-            "Delay {diff_usecs} usecs",
-        );
-
-        Ok(())
-    }
+    stamper_type: StamperType,
 }
 
 impl Default for TsLatencyMeasure {
     fn default() -> Self {
+        let stamper_type = StamperType::default();
         Self {
             props: Mutex::new(Properties::default()),
             clock: SystemClock::obtain(),
+            reader: Mutex::new(create_reader(stamper_type)),
         }
     }
 }
@@ -185,6 +63,7 @@ impl Default for Properties {
             width: DEFAULT_WIDTH,
             height: DEFAULT_HEIGHT,
             tolerance: DEFAULT_TOLERANCE,
+            stamper_type: StamperType::default(),
         }
     }
 }
@@ -211,6 +90,30 @@ impl ObjectImpl for TsLatencyMeasure {
                     .blurb("Binary time code Y position")
                     .default_value(0)
                     .mutable_playing()
+                    .build(),
+                glib::ParamSpecUInt64::builder("width")
+                    .nick("width")
+                    .blurb("Binary time code width")
+                    .default_value(DEFAULT_WIDTH as u64)
+                    .mutable_playing()
+                    .build(),
+                glib::ParamSpecUInt64::builder("height")
+                    .nick("height")
+                    .blurb("Binary time code height")
+                    .default_value(DEFAULT_HEIGHT as u64)
+                    .mutable_playing()
+                    .build(),
+                glib::ParamSpecUInt::builder("tolerance")
+                    .nick("tolerance")
+                    .blurb("Tolerance for color matching")
+                    .default_value(DEFAULT_TOLERANCE)
+                    .mutable_playing()
+                    .build(),
+                glib::ParamSpecEnum::builder::<StamperType>("stamper-type")
+                    .nick("Stamper Type")
+                    .blurb("Type of timestamp reader to use (must match stamper)")
+                    .default_value(StamperType::default())
+                    .mutable_ready()
                     .build(),
             ]
         });
@@ -280,6 +183,18 @@ impl ObjectImpl for TsLatencyMeasure {
                 );
                 props.tolerance = tolerance;
             }
+            "stamper-type" => {
+                let mut props = self.props.lock().unwrap();
+                let stamper_type = value.get().expect("type checked upstream");
+                info!(
+                    CAT,
+                    imp: self,
+                    "Changing stamper type to {:?}",
+                    stamper_type
+                );
+                props.stamper_type = stamper_type;
+                *self.reader.lock().unwrap() = create_reader(stamper_type);
+            }
             _ => unimplemented!(),
         }
     }
@@ -305,6 +220,10 @@ impl ObjectImpl for TsLatencyMeasure {
             "tolerance" => {
                 let props = self.props.lock().unwrap();
                 props.tolerance.to_value()
+            }
+            "stamper-type" => {
+                let props = self.props.lock().unwrap();
+                props.stamper_type.to_value()
             }
             _ => unimplemented!(),
         }
@@ -364,15 +283,35 @@ impl VideoFilterImpl for TsLatencyMeasure {
         &self,
         frame: &mut VideoFrameRef<&mut BufferRef>,
     ) -> Result<FlowSuccess, FlowError> {
-        let fmt = frame.format_info();
-        let flags = fmt.flags();
+        let props = self.props.lock().unwrap();
+        let config = ReaderConfig {
+            x: props.x,
+            y: props.y,
+            width: props.width,
+            height: props.height,
+            tolerance: props.tolerance,
+        };
+        drop(props);
 
-        if flags.contains(VideoFormatFlags::RGB) {
-            self.measure_latency_using_time_code(frame, &[255, 255, 255], &[0, 0, 0])?;
-        } else if flags.contains(VideoFormatFlags::YUV) {
-            self.measure_latency_using_time_code(frame, &[255, 128, 128], &[0, 128, 128])?;
-        } else {
-            return Err(FlowError::NotSupported);
+        let reader = self.reader.lock().unwrap();
+        match reader.read(frame, &self.clock, &config)? {
+            Some(stamped_usecs) => {
+                let curr_usecs = self.clock.time().unwrap().useconds();
+                let diff_usecs = curr_usecs - stamped_usecs;
+                info!(
+                    CAT,
+                    imp: self,
+                    "Delay {} usecs",
+                    diff_usecs
+                );
+            }
+            None => {
+                error!(
+                    CAT,
+                    imp: self,
+                    "Failed to read timestamp from frame"
+                );
+            }
         }
 
         Ok(FlowSuccess::Ok)
